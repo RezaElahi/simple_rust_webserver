@@ -1,15 +1,14 @@
-use std::sync::mpsc::Receiver;
 use std::thread;
 use std::sync::{mpsc, Arc, Mutex};
 
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    sender: mpsc::Sender<Job>,
+    sender: Option<mpsc::Sender<Job>>,
 }
 
 struct Worker {
     id: usize,
-    thread: thread::JoinHandle<()>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Worker {
@@ -17,12 +16,21 @@ impl Worker {
 
         let thread = thread::spawn(move|| {
             loop {
-                let job = receiver.lock().unwrap().recv().unwrap();
-                println!("Worker {} got a job; executing.", id);
-                job();  
-            }
+                let job = receiver.lock().unwrap().recv();
+                match job {
+                    Ok(job) => {
+                        log::info!("Worker {} got a job; executing.", id);
+                        job();
+                    },
+                    Err(_) => {
+                        log::info!("Worker {} disconnected, shutting down", id);
+                        break;
+                    
+                    }
+                }
+            } 
         });
-        Worker { id, thread }
+        Worker { id, thread: Some(thread) }
     }
 }
 
@@ -36,9 +44,9 @@ impl ThreadPool {
     /// # Panics
     ///
     /// The `new` function will panic if the size is zero.
-    pub fn new(size: u32) -> ThreadPool {
+    pub fn new(size: usize) -> ThreadPool {
         assert!(size > 0);
-        let mut workers = Vec::with_capacity(size as usize);
+        let mut workers = Vec::with_capacity(size);
         let (tx, rx) = mpsc::channel();
         let rx = Arc::new(Mutex::new(rx));
         // let rx = Arc::new(rx);
@@ -46,16 +54,33 @@ impl ThreadPool {
         for id in 0..size {
             let receiver = Arc::clone(&rx);
 
-            workers.push(Worker::new(id as usize, receiver));
+            workers.push(Worker::new(id, receiver));
         }
 
-        ThreadPool { workers, sender: tx}
+        ThreadPool { workers, sender: Some(tx)}
     }
 
     pub fn execute<F>(&self, f: F)
     where
         F: FnOnce() + Send + 'static,
     {
-        self.sender.send(Box::new(f)).unwrap();
+        self.sender.as_ref().unwrap().send(Box::new(f)).unwrap();
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        
+        std::mem::drop(self.sender.take());
+
+        for worker in &mut self.workers {
+            log::debug!("drop (shutting down) worker {}", worker.id);
+
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            } else {
+                log::debug!("Worker {} already shut down", worker.id);
+            }
+        }
     }
 }
